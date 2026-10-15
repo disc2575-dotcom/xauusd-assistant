@@ -2,21 +2,24 @@
 core/scheduler.py
 جدولة تحديث البيانات والإشارات تلقائياً.
 - الأطر المفعلة: D1 + H4.
-- إشعارات عبر ntfy.sh.
+- إشعارات عبر Telegram فقط.
 - فلتر أخبار (Google News + Groq AI).
 - ترجمة العناوين إلى العربية.
 - حساب TPs متسلسل (TP3 > TP2 > TP1).
+- تحديث البيانات بـ 100 شمعة لكل إطار.
+- تأكيدات BOS + نماذج الشموع.
+- نماذج سعرية (Head & Shoulders, Double Top/Bottom).
 """
 
 import time
 import json
 import sqlite3
+import threading
 from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
 import numpy as np
-import requests
 
 from core.config import (
     DB_PATH, SYMBOL_TWELVEDATA, SYMBOL_DB,
@@ -34,6 +37,9 @@ from smc.engine import analyze
 SIGNAL_PATH = Path("data/signal.json")
 UPDATE_INTERVAL_MINUTES = 15
 
+# عدد الشموع المطلوبة عند التحديث
+UPDATE_BARS = 100
+
 ACTIVE_TIMEFRAMES = [tf for tf, s in TIMEFRAME_SETTINGS.items() if s.get("enabled", True)]
 
 TIMEFRAME_WEIGHTS = {
@@ -47,35 +53,35 @@ LOOKBACK_BARS = 300
 CONFIDENCE_MULTIPLIER = 80
 CONFIDENCE_CAP = 90
 
-NTFY_TOPIC = "Bot"
-NTFY_SERVER = "https://ntfy.sh"
-
 
 # ============================================================
-# الحالة
+# حالة التشغيل
 # ============================================================
 _scheduler_running = False
 _scheduler_thread = None
-_stop_event = None
+_stop_event = threading.Event()
 
 
 def is_scheduler_running() -> bool:
+    """التحقق من حالة Scheduler."""
     return _scheduler_running
 
 
 def log(message: str):
+    """طباعة رسالة مع التوقيت."""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{now}] {message}")
 
 
 # ============================================================
-# تحديث البيانات
+# تحديث البيانات (100 شمعة لكل إطار)
 # ============================================================
 def update_data():
-    log("🔄 تحديث البيانات...")
+    """تحديث بيانات جميع الأطر الزمنية بـ 100 شمعة."""
+    log(f"🔄 تحديث البيانات ({UPDATE_BARS} شمعة لكل إطار)...")
     for tf in TIMEFRAMES:
         try:
-            new_df = fetch_latest(tf, bars=10)
+            new_df = fetch_latest(tf, bars=UPDATE_BARS)
             new_rows, total = update_table(tf, new_df)
             log(f"   ✅ {tf}: {new_rows} صف جديد | المجموع: {total}")
         except Exception as e:
@@ -86,6 +92,7 @@ def update_data():
 # تحميل آخر N شمعة
 # ============================================================
 def load_latest_bars(timeframe: str, bars: int = LOOKBACK_BARS) -> pd.DataFrame:
+    """تحميل آخر N شمعة من قاعدة البيانات."""
     table = f"{SYMBOL_DB}_{timeframe}"
     conn = sqlite3.connect(str(DB_PATH))
     try:
@@ -104,6 +111,7 @@ def load_latest_bars(timeframe: str, bars: int = LOOKBACK_BARS) -> pd.DataFrame:
 # تحليل إطار واحد
 # ============================================================
 def analyze_single_timeframe(timeframe: str) -> dict:
+    """تحليل إطار زمني واحد."""
     try:
         df = load_latest_bars(timeframe, LOOKBACK_BARS)
         if len(df) < 30:
@@ -129,6 +137,7 @@ def analyze_single_timeframe(timeframe: str) -> dict:
 # المستويات: الدعم والمقاومة
 # ============================================================
 def find_support_resistance(df: pd.DataFrame, current_price: float) -> dict:
+    """حساب أقرب دعم ومقاومة."""
     if df is None or df.empty:
         return {"nearest_support": None, "nearest_resistance": None}
 
@@ -158,6 +167,7 @@ def find_support_resistance(df: pd.DataFrame, current_price: float) -> dict:
 # استخراج مناطق OB و FVG
 # ============================================================
 def extract_ob_fvg(df: pd.DataFrame, current_price: float, limit: int = 10) -> list:
+    """استخراج آخر مناطق OB و FVG."""
     if df is None or df.empty:
         return []
 
@@ -207,10 +217,107 @@ def extract_ob_fvg(df: pd.DataFrame, current_price: float, limit: int = 10) -> l
 
 
 # ============================================================
+# استخراج التأكيدات (BOS + نماذج الشموع)
+# ============================================================
+def extract_confirmations(df: pd.DataFrame, limit: int = 10) -> list:
+    """استخراج آخر تأكيدات BOS + نماذج الشموع."""
+    if df is None or df.empty:
+        return []
+
+    confirmations = []
+    last_rows = df.tail(200)
+
+    for _, row in last_rows.iterrows():
+        ts = str(row.get("timestamp", ""))
+
+        if row.get("bos_confirmed", False):
+            confirmations.append({
+                "type": "bos_confirmed",
+                "label": f"تأكيد BOS ({row.get('bos_confirmation_type', 'N/A')})",
+                "timestamp": ts,
+            })
+
+        if row.get("bullish_engulfing", False):
+            confirmations.append({
+                "type": "bullish_engulfing",
+                "label": "شمعة ابتلاعية صاعدة",
+                "timestamp": ts,
+            })
+
+        if row.get("bearish_engulfing", False):
+            confirmations.append({
+                "type": "bearish_engulfing",
+                "label": "شمعة ابتلاعية هابطة",
+                "timestamp": ts,
+            })
+
+        if row.get("bullish_pin_bar", False):
+            confirmations.append({
+                "type": "bullish_pin_bar",
+                "label": "مطرقة صاعدة",
+                "timestamp": ts,
+            })
+
+        if row.get("bearish_pin_bar", False):
+            confirmations.append({
+                "type": "bearish_pin_bar",
+                "label": "شهاب هابط",
+                "timestamp": ts,
+            })
+
+    return confirmations[-limit:]
+
+
+# ============================================================
+# استخراج النماذج السعرية
+# ============================================================
+def extract_patterns(df: pd.DataFrame, limit: int = 10) -> list:
+    """استخراج آخر النماذج السعرية."""
+    if df is None or df.empty:
+        return []
+
+    patterns = []
+    last_rows = df.tail(200)
+
+    for _, row in last_rows.iterrows():
+        ts = str(row.get("timestamp", ""))
+
+        if row.get("head_and_shoulders", False):
+            patterns.append({
+                "type": "head_and_shoulders",
+                "label": "Head & Shoulders (انعكاس هبوطي)",
+                "timestamp": ts,
+            })
+
+        if row.get("inverse_head_and_shoulders", False):
+            patterns.append({
+                "type": "inverse_head_and_shoulders",
+                "label": "Inverse Head & Shoulders (انعكاس صاعد)",
+                "timestamp": ts,
+            })
+
+        if row.get("double_top", False):
+            patterns.append({
+                "type": "double_top",
+                "label": "Double Top (انعكاس هبوطي)",
+                "timestamp": ts,
+            })
+
+        if row.get("double_bottom", False):
+            patterns.append({
+                "type": "double_bottom",
+                "label": "Double Bottom (انعكاس صاعد)",
+                "timestamp": ts,
+            })
+
+    return patterns[-limit:]
+
+
+# ============================================================
 # تحليل الأخبار + الترجمة
 # ============================================================
 def get_news_analysis() -> dict:
-    """جلب الأخبار وتحليلها باستخدام AI + ترجمة إلى العربية."""
+    """جلب الأخبار وتحليلها باستخدام AI + ترجمة."""
     log("📰 جلب الأخبار...")
     news = fetch_latest_news()
 
@@ -234,14 +341,13 @@ def get_news_analysis() -> dict:
 
     log(f"   🎯 المشاعر: {analysis.get('sentiment', 'N/A')} (score: {analysis.get('score', 0)})")
 
-    # العناوين بالإنجليزية
     headlines_en = [n["title"] for n in news[:8]]
 
     log("   🌐 ترجمة العناوين إلى العربية...")
     headlines_ar = translate_headlines(headlines_en)
 
-    analysis["headlines"] = headlines_ar          # عربي
-    analysis["headlines_en"] = headlines_en       # إنجليزي
+    analysis["headlines"] = headlines_ar
+    analysis["headlines_en"] = headlines_en
     analysis["sources"] = [n["source"] for n in news[:8]]
 
     return analysis
@@ -251,6 +357,7 @@ def get_news_analysis() -> dict:
 # توليد الإشارة
 # ============================================================
 def generate_signal():
+    """توليد الإشارة النهائية."""
     log("🎯 تحليل الأطر الزمنية...")
 
     timeframes_data = {}
@@ -295,6 +402,8 @@ def generate_signal():
     # ========================================================
     levels_data = {"current_price": round(current_price, 2) if current_price else None}
     zones = []
+    confirmations = []
+    patterns = []
 
     for tf_key in ["H1", "H4", "D1"]:
         if tf_key in timeframes_data and "df" in timeframes_data[tf_key]:
@@ -306,10 +415,14 @@ def generate_signal():
                 levels_data["nearest_resistance"] = sr["nearest_resistance"]
             if not zones:
                 zones = extract_ob_fvg(df, current_price)
+            if not confirmations:
+                confirmations = extract_confirmations(df)
+            if not patterns:
+                patterns = extract_patterns(df)
             break
 
     # ========================================================
-    # خطة الدخول (مع TP متسلسل)
+    # خطة الدخول
     # ========================================================
     entry = None
     stop_loss = None
@@ -327,7 +440,6 @@ def generate_signal():
 
             if tp3 <= tp2:
                 tp3 = round(tp2 + risk, 2)
-
             if tp2 <= tp1:
                 tp2 = round(tp1 + risk, 2)
                 tp3 = round(tp2 + risk, 2)
@@ -346,7 +458,6 @@ def generate_signal():
 
             if tp3 >= tp2:
                 tp3 = round(tp2 - risk, 2)
-
             if tp2 >= tp1:
                 tp2 = round(tp1 - risk, 2)
                 tp3 = round(tp2 - risk, 2)
@@ -394,7 +505,6 @@ def generate_signal():
     if confidence < MIN_CONFIDENCE:
         warnings.append(f"ثقة منخفضة ({confidence:.1f}%)")
 
-    # تعديل الإشارة بناءً على الأخبار
     news_sentiment = news_analysis.get("sentiment", "neutral")
     news_score = news_analysis.get("score", 0)
 
@@ -429,6 +539,8 @@ def generate_signal():
         "warnings": warnings,
         "levels": levels_data,
         "zones": zones,
+        "confirmations": confirmations,
+        "patterns": patterns,
         "conditional_scenarios": scenarios,
         "timeframes": {
             tf: {
@@ -451,118 +563,96 @@ def generate_signal():
 
 
 # ============================================================
-# إرسال ntfy
-# ============================================================
-def send_ntfy(signal: dict) -> bool:
-    if not signal or not NTFY_TOPIC:
-        return False
-
-    lines = [
-        f"🎯 الإشارة: {signal.get('signal', 'N/A')}",
-        f"📈 الاتجاه: {signal.get('bias', 'N/A').upper()}",
-        f"🎚️ الثقة: {signal.get('confidence', 0)}%",
-        f"💰 السعر: {signal.get('current_price', 'N/A')}",
-    ]
-
-    news = signal.get("news_analysis", {})
-    if news:
-        lines.append(f"📰 الأخبار: {news.get('sentiment', 'N/A')} ({news.get('score', 0)})")
-
-    message = "\n".join(lines)
-    url = f"{NTFY_SERVER}/{NTFY_TOPIC}"
-
-    try:
-        r = requests.post(
-            url,
-            data=message.encode("utf-8"),
-            headers={
-                "Title": f"XAUUSD: {signal.get('signal', 'N/A')}",
-                "Priority": "high",
-                "Tags": "chart_with_upwards_trend,gold",
-            },
-            timeout=10,
-        )
-        r.raise_for_status()
-        log("   ✅ تم إرسال الإشعار")
-        return True
-    except Exception as e:
-        log(f"   ❌ خطأ: {e}")
-        return False
-
-
-# ============================================================
 # دورة واحدة
 # ============================================================
 def run_once():
+    """تشغيل دورة واحدة (تحديث + إشارة + Telegram)."""
     log("=" * 60)
     log("🚀 دورة جديدة")
     log("=" * 60)
+
     update_data()
     signal = generate_signal()
+
     if signal:
         log(f"📊 {signal['signal']} | السعر: {signal.get('current_price', 'N/A')}")
-        send_ntfy(signal)
+
+        try:
+            from bot.telegram_notifier import send_telegram
+            log("📤 إرسال إلى Telegram...")
+            send_telegram(signal, send_charts=True)
+        except Exception as e:
+            log(f"⚠️ فشل Telegram: {e}")
+
     log("=" * 60)
 
 
 # ============================================================
 # التشغيل المستمر
 # ============================================================
-def run_scheduler(interval_minutes: int = UPDATE_INTERVAL_MINUTES, max_cycles: int = None):
-    global _scheduler_running, _stop_event
-    import threading
+def _scheduler_loop(interval_minutes: int):
+    """حلقة Scheduler المستمرة."""
+    global _scheduler_running
 
-    _stop_event = threading.Event()
+    try:
+        while not _stop_event.is_set():
+            try:
+                run_once()
+            except Exception as e:
+                log(f"❌ خطأ في الدورة: {e}")
+
+            log(f"⏳ انتظار {interval_minutes} دقيقة...")
+            for _ in range(interval_minutes * 60):
+                if _stop_event.is_set():
+                    break
+                time.sleep(1)
+    finally:
+        _scheduler_running = False
+        log("🛑 Scheduler توقف")
+
+
+def run_scheduler(interval_minutes: int = UPDATE_INTERVAL_MINUTES):
+    """تشغيل Scheduler في الوضع المتزامن."""
+    global _scheduler_running
+
     _scheduler_running = True
+    _stop_event.clear()
 
     log(f"🕐 بدء Scheduler (كل {interval_minutes} دقيقة)")
     log(f"   الأطر: {', '.join(ACTIVE_TIMEFRAMES)}")
 
-    cycle = 0
-    while _scheduler_running:
-        cycle += 1
-        log(f"\n🔁 الدورة #{cycle}")
-        try:
-            run_once()
-        except KeyboardInterrupt:
-            log("\n⏹️ تم الإيقاف")
-            break
-        except Exception as e:
-            log(f"❌ خطأ: {e}")
-
-        if max_cycles and cycle >= max_cycles:
-            break
-
-        log(f"⏳ انتظار {interval_minutes} دقيقة...")
-        for _ in range(interval_minutes * 60):
-            if _stop_event.is_set() or not _scheduler_running:
-                break
-            time.sleep(1)
-
-    _scheduler_running = False
+    _scheduler_loop(interval_minutes)
 
 
 def start_scheduler(interval_minutes: int = UPDATE_INTERVAL_MINUTES) -> bool:
+    """بدء Scheduler في thread منفصل."""
     global _scheduler_running, _scheduler_thread
-    import threading
+
     if _scheduler_running:
         return False
+
+    _stop_event.clear()
     _scheduler_thread = threading.Thread(
-        target=run_scheduler,
+        target=_scheduler_loop,
         args=(interval_minutes,),
         daemon=True,
     )
+    _scheduler_running = True
     _scheduler_thread.start()
+    log(f"▶️ Scheduler بدأ (كل {interval_minutes} دقيقة)")
     return True
 
 
 def stop_scheduler() -> bool:
-    global _scheduler_running, _stop_event
+    """إيقاف Scheduler."""
+    global _scheduler_running
+
     if not _scheduler_running:
         return False
-    if _stop_event:
-        _stop_event.set()
+
+    _stop_event.set()
     _scheduler_running = False
+    log("⏹️ جاري إيقاف Scheduler...")
     return True
 
 
@@ -570,7 +660,9 @@ def stop_scheduler() -> bool:
 # Main
 # ============================================================
 def main():
+    """نقطة الدخول."""
     import sys
+
     if len(sys.argv) > 1 and sys.argv[1] == "--once":
         run_once()
     else:

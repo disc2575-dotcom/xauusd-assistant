@@ -1,7 +1,30 @@
-.venv/
-venv/
+# === بيانات متغيرة ===
+data/signal.json
+data/*.png
+data/*.db
+data/*.sqlite3
+data/signal*.json
+
+# === نسخ احتياطية ===
+backup_*.tar.gz
+*.tar.gz
+*.zip
+
+# === ملفات مؤقتة ===
 __pycache__/
 *.pyc
+*.pyo
+*.swp
+*.swo
+structure.txt*
+*.log
+pd.DataFrame
+
+# === متغيرات البيئة ===
 .env
-data/*.db
-*.key
+.env.*
+
+# === بيئات افتراضية ===
+.venv/
+venv/
+env/

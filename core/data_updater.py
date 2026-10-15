@@ -1,6 +1,7 @@
 """
 core/data_updater.py
-تحديث market.db ببيانات جديدة من TwelveData.
+تحديث البيانات من TwelveData.
++ إصلاح: تحديث القيم الموجودة (keep="last")
 """
 
 import os
@@ -8,12 +9,11 @@ import time
 import sqlite3
 import requests
 import pandas as pd
-from pathlib import Path
 from dotenv import load_dotenv
 
 from core.config import (
     DB_PATH, SYMBOL_TWELVEDATA, SYMBOL_DB,
-    BARS_PER_TIMEFRAME, TIMEFRAMES
+    BARS_PER_TIMEFRAME, TIMEFRAMES,
 )
 
 load_dotenv()
@@ -46,11 +46,11 @@ def fetch_latest(timeframe: str, bars: int = None) -> pd.DataFrame:
         "timezone": "UTC",
     }
 
-    response = requests.get(url, params=params, timeout=60)
-    data = response.json()
+    r = requests.get(url, params=params, timeout=60)
+    data = r.json()
 
     if "values" not in data:
-        raise ValueError(f"❌ خطأ من TwelveData: {data.get('message', data)}")
+        raise ValueError(f"❌ خطأ: {data.get('message', data)}")
 
     df = pd.DataFrame(data["values"])
     df = df.rename(columns={"datetime": "timestamp"})
@@ -67,28 +67,42 @@ def fetch_latest(timeframe: str, bars: int = None) -> pd.DataFrame:
 
 
 def update_table(timeframe: str, new_df: pd.DataFrame):
-    """دمج البيانات الجديدة مع الموجودة."""
+    """
+    دمج البيانات الجديدة مع الموجودة.
+    ✅ الإصلاح: تحديث القيم الموجودة (keep="last")
+    """
     table_name = f"{SYMBOL_DB}_{timeframe}"
     conn = sqlite3.connect(str(DB_PATH))
 
     try:
+        # قراءة البيانات الموجودة
         existing = pd.read_sql(
             f'SELECT * FROM "{table_name}"',
             conn,
-            parse_dates=["timestamp"]
+            parse_dates=["timestamp"],
         )
 
-        combined = pd.concat([existing, new_df], ignore_index=True)
-        combined = combined.drop_duplicates(subset="timestamp")
+        # ✅ إزالة الصفوف القديمة التي ستُحدَّث
+        existing_filtered = existing[
+            ~existing["timestamp"].isin(new_df["timestamp"])
+        ]
+
+        # ✅ دمج الجديد + القديم (بدون تكرار)
+        combined = pd.concat([existing_filtered, new_df], ignore_index=True)
+        combined = combined.drop_duplicates(subset="timestamp", keep="last")
         combined = combined.sort_values("timestamp").reset_index(drop=True)
 
+        # حفظ
         combined.to_sql(table_name, conn, if_exists="replace", index=False)
         conn.execute(
             f'CREATE INDEX IF NOT EXISTS idx_{table_name}_ts ON "{table_name}"(timestamp)'
         )
         conn.commit()
 
-        new_rows = len(combined) - len(existing)
+        # حساب الصفوف الجديدة
+        new_timestamps = set(new_df["timestamp"]) - set(existing["timestamp"])
+        new_rows = len(new_timestamps)
+
         return new_rows, len(combined)
     finally:
         conn.close()
@@ -108,7 +122,7 @@ def update_all_timeframes():
             print(f"   ✅ {new_rows} صف جديد | المجموع: {total}")
             time.sleep(8)
         except Exception as e:
-            print(f"   ❌ خطأ في {tf}: {e}")
+            print(f"   ⚠️ {tf}: {e}")
 
     print("\n" + "=" * 60)
     print("✅ انتهى التحديث")
