@@ -8,7 +8,9 @@ smc/signal_generator.py
 3. شرح شرط التحول إلى إشارة فعلية
 4. عرض مستويات التداول حتى في حالة WAIT
 5. [جديد] تجاهل الأطر الغائبة أو الفارغة في _calculate_bias
-         (كانت تُحسب كـ neutral بأوزانها الكاملة، مما يُشوّه النتيجة)
+6. [إصلاح] تنظيف قيم الاتجاه (strip + lower) لتفادي مشاكل المسافات الخفية
+7. [إصلاح] تعديل الأوزان لتعكس الأهمية الحقيقية لكل إطار:
+   D1 و H4 يحددان الاتجاه العام، والأطر الصغيرة للتصحيح فقط.
 """
 
 from typing import Optional
@@ -17,13 +19,14 @@ from typing import Optional
 # ============================================================
 # إعدادات
 # ============================================================
+# الأوزان المعدّلة: D1 و H4 لهما ثقل كبير، والأطر الصغيرة للتأكيد فقط
 TIMEFRAME_WEIGHTS = {
-    "D1": 3.0,
-    "H4": 3.0,
+    "D1": 8.0,
+    "H4": 4.0,
     "H1": 2.0,
-    "M30": 2.0,
-    "M15": 1.0,
-    "M5": 1.0,
+    "M30": 1.0,
+    "M15": 0.5,
+    "M5": 0.25,
 }
 
 MIN_CONFIDENCE_FOR_SIGNAL = 60
@@ -35,10 +38,19 @@ WEAK_TREND_THRESHOLD = 0.40
 # الدوال المساعدة
 # ============================================================
 
-def _trend_score(trend: str) -> float:
-    if trend == "bullish":
+def _trend_score(trend) -> float:
+    """
+    تحويل الاتجاه إلى score رقمي مع تنظيف القيمة.
+    - bullish → +1.0
+    - bearish → -1.0
+    - nonelse → 0.0
+    """
+    if trend is None:
+        return 0.0
+    t = str(trend).strip().lower()
+    if t == "bullish":
         return 1.0
-    elif trend == "bearish":
+    elif t == "bearish":
         return -1.0
     return 0.0
 
@@ -46,41 +58,34 @@ def _trend_score(trend: str) -> float:
 def _calculate_bias(snapshot: dict) -> dict:
     """
     حساب الاتجاه العام المرجّح.
-    
-    ✅ إصلاح مهم:
-    كان الكود السابق يمر على كل الأطر في TIMEFRAME_WEIGHTS، ويحسب
-    الأطر الغائبة (غير الموجودة في snapshot) كـ "neutral" بأوزانها
-    الكاملة، مما يُخفّض النتيجة بشكل كبير.
-    
-    مثال:
-        snapshot يحتوي فقط على H1 (bullish, وزن 2)
-        total_weight كان يصبح 12 (كل الأطر)
-        weighted_sum كان يصبح +2.0 (H1 فقط)
-        weighted_score = 2/12 = 0.167 (ضعيف جداً، رغم أن H1 صاعد بوضوح!)
-    
-    الآن: نتجاهل الأطر الغائبة، فيصبح:
-        total_weight = 2.0 (H1 فقط)
-        weighted_sum = +2.0
-        weighted_score = +1.0 (قوي وواضح)
     """
     total_weight = 0.0
     weighted_sum = 0.0
     bullish_weight = 0.0
     bearish_weight = 0.0
 
+    print("\n[DEBUG] === _calculate_bias ===")
+    print(f"[DEBUG] snapshot keys: {list(snapshot.keys())}")
+
     for tf, weight in TIMEFRAME_WEIGHTS.items():
         tf_data = snapshot.get(tf, {})
 
-        # ✅ الإصلاح: تجاهل الأطر الغائبة أو الفارغة أو التي فشلت
+        found = bool(tf_data)
+        trend_val = tf_data.get("current_trend") if tf_data else None
+        error_val = tf_data.get("error") if tf_data else None
+
+        # تجاهل الأطر الغائبة أو الفارغة أو التي فشلت
         if not tf_data or "error" in tf_data:
+            print(f"[DEBUG] {tf}: SKIPPED (found={found}, error={error_val})")
             continue
-
-        # نتأكد من وجود current_trend
         if "current_trend" not in tf_data:
+            print(f"[DEBUG] {tf}: SKIPPED (no current_trend)")
             continue
 
-        trend = tf_data.get("current_trend", "neutral")
+        trend = str(tf_data.get("current_trend", "neutral")).strip().lower()
         score = _trend_score(trend)
+
+        print(f"[DEBUG] {tf}: trend='{trend}', score={score}, weight={weight}")
 
         total_weight += weight
         weighted_sum += score * weight
@@ -90,7 +95,10 @@ def _calculate_bias(snapshot: dict) -> dict:
         elif trend == "bearish":
             bearish_weight += weight
 
-    # لا توجد أطر صالحة
+    weighted_score = weighted_sum / total_weight if total_weight > 0 else 0.0
+    print(f"[DEBUG] total_weight={total_weight}, weighted_sum={weighted_sum}, weighted_score={weighted_score:.4f}")
+    print("[DEBUG] === end ===\n")
+
     if total_weight == 0:
         return {
             "weighted_score": 0.0,
@@ -102,9 +110,7 @@ def _calculate_bias(snapshot: dict) -> dict:
             "valid_timeframes": 0,
         }
 
-    weighted_score = weighted_sum / total_weight
-
-    # تحديد الاتجاه
+    # العتبة: 0.3 (يمكن تعديلها حسب الحساسية المطلوبة)
     if weighted_score >= 0.3:
         bias = "bullish"
     elif weighted_score <= -0.3:
@@ -112,7 +118,6 @@ def _calculate_bias(snapshot: dict) -> dict:
     else:
         bias = "neutral"
 
-    # نسبة الإجماع
     if bias == "bullish":
         consensus = bullish_weight / total_weight
     elif bias == "bearish":
@@ -336,7 +341,6 @@ def generate_signal(snapshot: dict) -> dict:
     bias = bias_info["bias"]
     is_weak_trend = abs(bias_info["weighted_score"]) < WEAK_TREND_THRESHOLD
 
-    # قرار الإشارة
     if bias == "neutral" or confidence < MIN_CONFIDENCE_FOR_SIGNAL:
         signal = "WAIT"
     elif conflict_info["conflict"]:
@@ -351,7 +355,6 @@ def generate_signal(snapshot: dict) -> dict:
     levels = _find_nearest_levels(snapshot, bias)
     conditional_scenarios = _generate_conditional_scenarios(snapshot, levels, bias)
 
-    # الأسباب
     reasoning = []
     reasoning.append(f"الاتجاه المرجّح: {bias} (score: {bias_info['weighted_score']:.2f})")
     reasoning.append(f"الإجماع: {bias_info['consensus_ratio']*100:.0f}%")
@@ -362,7 +365,6 @@ def generate_signal(snapshot: dict) -> dict:
             f"والأطر الصغيرة {conflict_info['small_trend']}"
         )
 
-    # التحذيرات
     warnings = []
 
     if is_weak_trend:
@@ -379,7 +381,6 @@ def generate_signal(snapshot: dict) -> dict:
             f"ثقة منخفضة ({confidence}%) — أقل من الحد الأدنى ({MIN_CONFIDENCE_FOR_SIGNAL}%)"
         )
 
-    # شرط التحول
     switch_condition = None
     if signal == "WAIT":
         if conflict_info["conflict"]:
@@ -397,7 +398,6 @@ def generate_signal(snapshot: dict) -> dict:
                 f"انتظر حتى تصل الثقة إلى {MIN_CONFIDENCE_FOR_SIGNAL}% على الأقل"
             )
 
-    # تفصيل الأطر
     timeframes = {}
     for tf, weight in TIMEFRAME_WEIGHTS.items():
         tf_data = snapshot.get(tf, {})

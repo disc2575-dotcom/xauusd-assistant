@@ -1,6 +1,10 @@
 """
 run_day2.py
 تشغيل تحليل SMC الكامل على كل الأطر الزمنية وحفظ النتائج.
+
+يشمل:
+1. تحليل كل إطار (analyze) + ملخص (summarize) → smc_snapshot.json
+2. توليد الإشارة العامة (generate_signal) → signal.json
 """
 
 import json
@@ -11,15 +15,11 @@ import pandas as pd
 
 from core.config import SYMBOL_DB as SYMBOL, TIMEFRAMES, DB_PATH
 from smc.engine import analyze, summarize
+from smc.signal_generator import generate_signal
 
 
-def load_from_db(symbol: str, timeframe: str, db_path, drop_last: bool = True) -> pd.DataFrame:
-    """
-    تحميل الشموع لإطار زمني واحد من قاعدة البيانات.
-
-    drop_last: إذا True، نستبعد آخر شمعة (غير مكتملة) لأن التحليل
-               عليها غير موثوق — الشمعة الحالية قد تتغير في ثوانيها الأخيرة.
-    """
+def load_from_db(symbol: str, timeframe: str, db_path) -> pd.DataFrame:
+    """تحميل الشموع لإطار زمني واحد من قاعدة البيانات."""
     table = f"{symbol}_{timeframe}"
     conn = sqlite3.connect(str(db_path))
     try:
@@ -30,17 +30,15 @@ def load_from_db(symbol: str, timeframe: str, db_path, drop_last: bool = True) -
         )
     finally:
         conn.close()
-
-    # استبعاد آخر شمعة (غير مكتملة)
-    if drop_last and len(df) > 1:
-        df = df.iloc[:-1].copy()
-
     return df
 
 
 def main():
     results = {}
 
+    # ============================================
+    # 1) تحليل كل إطار زمني
+    # ============================================
     for tf in TIMEFRAMES:
         print(f"--- {tf} ---")
         try:
@@ -60,24 +58,19 @@ def main():
 
             print(f"  الاتجاه الحالي : {summary['current_trend']}")
             print(f"  آخر إغلاق      : {summary['last_close']:.2f}")
-            print(f"  آخر شمعة       : {summary['last_timestamp']}")
-            print(f"  --------- الأعداد الكلية ---------")
-            print(f"  BOS/CHOCH      : {summary['totals']['events']}")
-            print(f"  FVG            : {summary['totals']['fvgs']}")
-            print(f"  Order Blocks   : {summary['totals']['order_blocks']}")
-            print(f"  مناطق سيولة    : {summary['totals']['liquidity']}")
-            print(f"  --------- آخر 5 من كل نوع ---------")
-            print(f"  آخر 5 أحداث    : {len(summary['events'])}")
-            print(f"  آخر 5 FVG      : {len(summary['fvgs'])}")
-            print(f"  آخر 5 OB       : {len(summary['order_blocks'])}")
-            print(f"  آخر 5 سيولة    : {len(summary['liquidity'])}")
+            print(f"  أحداث BOS/CHOCH: {len(summary['events'])}")
+            print(f"  FVG نشطة       : {len(summary['fvgs'])}")
+            print(f"  Order Blocks   : {len(summary['order_blocks'])}")
+            print(f"  مناطق سيولة    : {len(summary['liquidity'])}")
             print()
 
         except Exception as e:
             print(f"❌ خطأ في {tf}: {e}\n")
             results[tf] = {"error": str(e)}
 
-    # حفظ النتائج
+    # ============================================
+    # 2) حفظ Snapshot التحليل
+    # ============================================
     out_path = Path("data/smc_snapshot.json")
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -85,6 +78,51 @@ def main():
         json.dump(results, f, indent=2, ensure_ascii=False, default=str)
 
     print(f"✅ تم حفظ النتائج في {out_path}")
+
+    # ============================================
+    # 3) توليد الإشارة العامة (Signal)
+    # ============================================
+    try:
+        signal = generate_signal(results)
+
+        signal_path = Path("data/signal.json")
+        with open(signal_path, "w", encoding="utf-8") as f:
+            json.dump(signal, f, indent=2, ensure_ascii=False, default=str)
+
+        print()
+        print("=" * 60)
+        print("📊 الإشارة العامة:")
+        print("=" * 60)
+        print(f"  الإشارة   : {signal.get('signal', 'N/A')}")
+        print(f"  الثقة     : {signal.get('confidence', 0)}%")
+        print(f"  الاتجاه   : {signal.get('bias', 'N/A')}")
+        print(f"  Score     : {signal.get('bias_score', 0)}")
+        print(f"  الأطر     : {signal.get('valid_timeframes', 0)} صالحة")
+        print(f"  حفظ في    : {signal_path}")
+        print("=" * 60)
+
+        # عرض التحذيرات إن وجدت
+        warnings = signal.get("warnings", [])
+        if warnings:
+            print("⚠️ التحذيرات:")
+            for w in warnings:
+                print(f"  - {w}")
+
+        # عرض المستويات
+        levels = signal.get("levels", {})
+        if levels:
+            print("📈 المستويات:")
+            print(f"  السعر الحالي : {levels.get('current_price', 'N/A')}")
+            print(f"  دخول         : {levels.get('entry', 'N/A')}")
+            print(f"  وقف الخسارة  : {levels.get('stop_loss', 'N/A')}")
+            print(f"  الأهداف      : {levels.get('targets', [])}")
+            print(f"  دعم          : {levels.get('nearest_support', 'N/A')}")
+            print(f"  مقاومة       : {levels.get('nearest_resistance', 'N/A')}")
+
+    except Exception as e:
+        print(f"❌ خطأ في توليد الإشارة: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 if __name__ == "__main__":

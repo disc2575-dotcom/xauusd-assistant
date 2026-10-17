@@ -1,12 +1,19 @@
 """
 bot/chart_generator.py
-توليد رسوم بيانية عالية الدقة لـ 3 أطر: D1, H1, M15.
+توليد رسوم بيانية لـ 3 أطر: D1, H1, M15 — مع مستويات محسوبة لكل إطار على حدة.
+
+التغييرات:
+1. الدعم/المقاومة/المناطق تُحسب لكل إطار من بياناته (smc.levels.extract_levels).
+2. العنوان العلوي موحّد (suptitle) بلا تداخل.
+3. المناطق تبدأ من شمعة تكوّنها ولا تمتد على كامل الشارت، والملغاة لا تُرسم.
+4. تنبيه على الشارت إذا كانت البيانات قديمة.
+5. بدون فجوات عطلة وبمحور زمني مرتّب.
+6. استخدام النصوص الإنجليزية على الشارت لتفادي مشكلة تشويه العربية في matplotlib.
 """
 
 import sys
 from pathlib import Path
 
-# ✅ إضافة مسار المشروع إلى sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import sqlite3
@@ -18,19 +25,17 @@ import matplotlib.pyplot as plt
 import mplfinance as mpf
 
 from core.config import DB_PATH, SYMBOL_DB
+from smc.levels import extract_levels
 
 
-# ============================================================
-# الأطر المدعومة
-# ============================================================
 SUPPORTED_TIMEFRAMES = ["D1", "H1", "M15"]
 
-# عدد الشموع لكل إطار
-BARS_PER_TF = {
-    "D1": 100,
-    "H1": 200,
-    "M15": 300,
-}
+BARS_PER_TF = {"D1": 100, "H1": 200, "M15": 300}
+
+# أقصى عمر مقبول لآخر شمعة (بالساعات) قبل إظهار تنبيه "بيانات قديمة"
+STALE_AFTER_HOURS = {"D1": 72, "H1": 6, "M15": 2}
+
+DATE_FORMAT = {"D1": "%b %d", "H1": "%b %d %H:%M", "M15": "%b %d %H:%M"}
 
 
 def load_data(timeframe: str, bars: int = None) -> pd.DataFrame:
@@ -54,42 +59,51 @@ def load_data(timeframe: str, bars: int = None) -> pd.DataFrame:
     return df
 
 
+def _is_stale(last_ts: pd.Timestamp, timeframe: str) -> bool:
+    now = pd.Timestamp.now(tz=last_ts.tz) if last_ts.tzinfo else pd.Timestamp.now()
+    age_h = (now - last_ts).total_seconds() / 3600
+    return age_h > STALE_AFTER_HOURS.get(timeframe, 6)
+
+
+def _hline(ax, y, color, ls, lw, alpha, label):
+    ax.axhline(y=y, color=color, linestyle=ls, linewidth=lw, alpha=alpha, label=label)
+
+
 def generate_chart(signal: dict, timeframe: str) -> str:
-    """
-    توليد صورة رسم بياني عالية الدقة لإطار واحد.
-    
-    الإرجاع:
-        مسار الصورة أو None.
-    """
+    """توليد صورة رسم بياني لإطار واحد. الإرجاع: مسار الصورة أو None."""
     if timeframe not in SUPPORTED_TIMEFRAMES:
         print(f"⚠️ الإطار {timeframe} غير مدعوم")
         return None
 
+    signal = signal or {}
+
     try:
         # 1. تحميل البيانات
-        df = load_data(timeframe)
-        if df.empty:
+        raw = load_data(timeframe)
+        if raw.empty:
             print(f"⚠️ لا توجد بيانات لـ {timeframe}")
             return None
 
-        # 2. تجهيز البيانات
-        df = df.set_index("timestamp")
-        df = df.rename(columns={
-            "open": "Open",
-            "high": "High",
-            "low": "Low",
-            "close": "Close",
-            "volume": "Volume",
+        # 2. مستويات هذا الإطار فقط (من بياناته نفسها)
+        try:
+            tf_levels = extract_levels(raw[["timestamp", "open", "high", "low", "close"]].copy())
+        except Exception as e:
+            print(f"⚠️ تعذّر حساب مستويات {timeframe}: {e}")
+            tf_levels = {"current_price": float(raw["close"].iloc[-1]),
+                         "nearest_resistance": None, "nearest_support": None, "zones": []}
+
+        last_ts = pd.Timestamp(raw["timestamp"].iloc[-1])
+        stale = _is_stale(last_ts, timeframe)
+
+        # 3. تجهيز البيانات
+        df = raw.set_index("timestamp").rename(columns={
+            "open": "Open", "high": "High", "low": "Low",
+            "close": "Close", "volume": "Volume",
         })
+        n = len(df)
 
-        # 3. النمط (Style)
-        mc = mpf.make_marketcolors(
-            up="#26a69a",
-            down="#ef5350",
-            edge="inherit",
-            wick="inherit",
-        )
-
+        # 4. النمط
+        mc = mpf.make_marketcolors(up="#26a69a", down="#ef5350", edge="inherit", wick="inherit")
         style = mpf.make_mpf_style(
             marketcolors=mc,
             facecolor="#131722",
@@ -105,157 +119,81 @@ def generate_chart(signal: dict, timeframe: str) -> str:
             },
         )
 
-        # 4. رسم الشموع
+        # 5. رسم الشموع (بدون title داخلي لتفادي التداخل)
         fig, axes = mpf.plot(
             df,
             type="candle",
             style=style,
             volume=False,
-            title=f"\n\nXAUUSD - {timeframe}",
-            ylabel="السعر (USD)",
+            ylabel="Price (USD)",
             figsize=(16, 9),
             returnfig=True,
             tight_layout=False,
-            scale_padding={"left": 1.5, "right": 1.5, "top": 1.5, "bottom": 1.5},
+            show_nontrading=False,
+            datetime_format=DATE_FORMAT[timeframe],
+            xrotation=30,
         )
-
         ax = axes[0]
-
-        # تكبير الخطوط
         ax.tick_params(axis="both", labelsize=12)
-        ax.title.set_size(18)
         ax.yaxis.label.set_size(13)
 
-        # 5. إضافة المستويات
-        if signal:
-            levels = signal.get("levels", {})
+        # 6. المناطق: تبدأ من شمعة التكوّن وتمتد لليمين فقط
+        for zone in tf_levels.get("zones", []):
+            color = "#26a69a" if zone["side"] == "bullish" else "#ef5350"
+            x0 = max(0, min(zone["start_idx"], n - 1))
+            ax.fill_between([x0, n + 2], zone["bottom"], zone["top"],
+                            color=color, alpha=0.15, linewidth=0)
 
-            cp = levels.get("current_price") or signal.get("current_price")
-            if cp:
-                ax.axhline(
-                    y=cp,
-                    color="#2196f3",
-                    linestyle="-",
-                    linewidth=1.5,
-                    alpha=0.8,
-                    label=f"السعر: {cp}",
-                )
+        # 7. المستويات
+        cp = tf_levels.get("current_price")
+        if cp:
+            _hline(ax, cp, "#2196f3", "-", 1.5, 0.8, f"Price: {cp:.2f}")
 
-            r = levels.get("nearest_resistance")
-            if r:
-                ax.axhline(
-                    y=r,
-                    color="#ef5350",
-                    linestyle="--",
-                    linewidth=1.2,
-                    alpha=0.8,
-                    label=f"مقاومة: {r}",
-                )
+        r = tf_levels.get("nearest_resistance")
+        if r:
+            _hline(ax, r, "#ef5350", "--", 1.2, 0.85, f"Resistance: {r:.2f}")
 
-            s = levels.get("nearest_support")
-            if s:
-                ax.axhline(
-                    y=s,
-                    color="#26a69a",
-                    linestyle="--",
-                    linewidth=1.2,
-                    alpha=0.8,
-                    label=f"دعم: {s}",
-                )
+        s = tf_levels.get("nearest_support")
+        if s:
+            _hline(ax, s, "#26a69a", "--", 1.2, 0.85, f"Support: {s:.2f}")
 
-            entry = levels.get("entry")
-            if entry:
-                ax.axhline(
-                    y=entry,
-                    color="#ff9800",
-                    linestyle="-",
-                    linewidth=1.8,
-                    alpha=0.9,
-                    label=f"دخول: {entry}",
-                )
+        # مستويات الصفقة (من الإشارة) إن وُجدت
+        sig_levels = signal.get("levels", {}) or {}
+        if sig_levels.get("entry"):
+            _hline(ax, sig_levels["entry"], "#ff9800", "-", 1.8, 0.9, f"Entry: {sig_levels['entry']}")
+        if sig_levels.get("stop_loss"):
+            _hline(ax, sig_levels["stop_loss"], "#d32f2f", ":", 1.3, 0.8, f"SL: {sig_levels['stop_loss']}")
+        for i, tp in enumerate(sig_levels.get("targets", []) or [], 1):
+            _hline(ax, tp, "#388e3c", ":", 1.2, 0.8, f"TP{i}: {tp}")
 
-            sl = levels.get("stop_loss")
-            if sl:
-                ax.axhline(
-                    y=sl,
-                    color="#d32f2f",
-                    linestyle=":",
-                    linewidth=1.3,
-                    alpha=0.8,
-                    label=f"وقف: {sl}",
-                )
+        ax.set_xlim(-1, n + 3)
 
-            targets = levels.get("targets", [])
-            for i, tp in enumerate(targets, 1):
-                ax.axhline(
-                    y=tp,
-                    color="#388e3c",
-                    linestyle=":",
-                    linewidth=1.2,
-                    alpha=0.8,
-                    label=f"TP{i}: {tp}",
-                )
+        ax.legend(loc="upper left", fontsize=11, facecolor="#1e222d",
+                  edgecolor="#2a2e39", labelcolor="#d1d4dc", framealpha=0.95, borderpad=1)
 
-        # 6. مناطق OB/FVG
-        if signal:
-            zones = signal.get("zones", [])
-            for zone in zones:
-                z_type = zone.get("type", "")
-                z_top = zone.get("top")
-                z_bottom = zone.get("bottom")
-
-                if z_top is None or z_bottom is None:
-                    continue
-
-                if "bullish" in z_type:
-                    color = "#26a69a"
-                    alpha = 0.12
-                elif "bearish" in z_type:
-                    color = "#ef5350"
-                    alpha = 0.12
-                else:
-                    continue
-
-                ax.axhspan(z_bottom, z_top, color=color, alpha=alpha)
-
-        # 7. Legend
-        ax.legend(
-            loc="upper left",
-            fontsize=11,
-            facecolor="#1e222d",
-            edgecolor="#2a2e39",
-            labelcolor="#d1d4dc",
-            framealpha=0.95,
-            borderpad=1,
-        )
-
-        # 8. معلومات الإشارة في الأعلى
+        # 8. العنوان + معلومات الإشارة (سطران منفصلان، بلا تداخل)
         sig = signal.get("signal", "WAIT")
         conf = signal.get("confidence", 0)
-        bias = signal.get("bias", "N/A")
+        bias = signal.get("bias") or tf_levels.get("trend", "N/A")
 
-        info_text = f"الإشارة: {sig}  |  الثقة: {conf}%  |  الاتجاه: {bias}"
-        fig.text(
-            0.5, 0.94,
-            info_text,
-            ha="center",
-            fontsize=13,
-            color="#d1d4dc",
-            weight="bold",
-        )
+        fig.suptitle(f"XAUUSD - {timeframe}", fontsize=18, color="#d1d4dc", y=0.97)
+        fig.text(0.5, 0.925,
+                 f"Signal: {sig}  |  Conf: {conf}%  |  Bias: {bias}",
+                 ha="center", fontsize=13, color="#d1d4dc", weight="bold")
 
-        # 9. حفظ الصورة
+        footer = f"Last candle: {last_ts:%Y-%m-%d %H:%M}"
+        if stale:
+            footer += "  [STALE DATA]"
+        fig.text(0.5, 0.895, footer, ha="center", fontsize=11,
+                 color="#ff9800" if stale else "#787b86")
+
+        fig.subplots_adjust(top=0.87)
+
+        # 9. حفظ
         output_path = Path(f"data/chart_{timeframe}.png")
         output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        fig.savefig(
-            output_path,
-            dpi=150,
-            bbox_inches="tight",
-            facecolor="#131722",
-            edgecolor="none",
-            pad_inches=0.3,
-        )
+        fig.savefig(output_path, dpi=150, bbox_inches="tight",
+                    facecolor="#131722", edgecolor="none", pad_inches=0.3)
         plt.close(fig)
 
         print(f"✅ تم توليد {timeframe}: {output_path}")
